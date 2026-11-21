@@ -1,0 +1,195 @@
+name: Deploy
+
+# Required Gitea repository secrets:
+#
+# Vercel:
+# - VERCEL_TOKEN
+# - VERCEL_ORG_ID
+# - VERCEL_PROJECT_ID
+#
+# Netlify:
+# - NETLIFY_TOKEN
+#
+# No API URL is configured here or in either dashboard: production builds
+# default to https://vsembeddings-api.krishnarajthadesar.in (see
+# src/lib/api.js), so Vercel's remote build and the Netlify build below produce
+# the same bundle. Set VITE_API_BASE only to point a build somewhere else.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+
+
+  # ==========================================
+  # NETLIFY DEPLOYMENT
+  # ==========================================
+
+  netlify:
+    name: Deploy to Netlify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Read Git metadata
+        id: metadata
+        run: |
+          REMOTE_URL="$(git config --get remote.origin.url)"
+
+          REPO_OWNER=$(printf '%s' "$REMOTE_URL" | sed -E 's#.*[:/]([^/]+)/[^/]+$#\1#')
+          REPO_NAME=$(basename -s .git "$REMOTE_URL")
+
+          REPO_NAME=$(printf '%s' "$REPO_NAME" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/--*/-/g' \
+            | sed 's/^-//;s/-$//')
+
+          REPO_OWNER=$(printf '%s' "$REPO_OWNER" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9-]/-/g' \
+            | sed 's/--*/-/g' \
+            | sed 's/^-//;s/-$//')
+
+          echo "primary=$REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "fallback=${REPO_NAME}-${REPO_OWNER}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Build project
+        run: npm run build
+
+      - name: Install Netlify CLI
+        run: npm install --global netlify-cli
+
+      - name: Deploy to Netlify
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          PRIMARY="${{ steps.metadata.outputs.primary }}"
+          FALLBACK="${{ steps.metadata.outputs.fallback }}"
+          API="https://api.netlify.com/api/v1"
+          AUTH="Authorization: Bearer $NETLIFY_AUTH_TOKEN"
+
+          # Build output folder (works for Vite/CRA/Next export/etc.)
+          DIR=""
+          for d in dist build out public; do
+            if [ -f "$d/index.html" ]; then DIR="$d"; break; fi
+          done
+          [ -n "$DIR" ] || { echo "No build output with index.html found"; exit 1; }
+
+          find_site() {
+            curl -fsS -H "$AUTH" "$API/sites?name=$1&filter=all&per_page=100" \
+              | jq -r --arg n "$1" '[.[] | select(.name == $n)][0].id // empty'
+          }
+          create_site() {
+            curl -sS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              -d "{\"name\":\"$1\"}" "$API/sites" | jq -r '.id // empty'
+          }
+
+          # Same repo -> same site, every run. Look in this account first;
+          # create only if neither name exists. If the primary name is taken
+          # globally by someone else, create under the fallback name instead.
+          SITE_ID=$(find_site "$PRIMARY")
+          [ -n "$SITE_ID" ] || SITE_ID=$(find_site "$FALLBACK")
+          if [ -z "$SITE_ID" ]; then
+            echo "No existing site; creating once."
+            SITE_ID=$(create_site "$PRIMARY")
+            [ -n "$SITE_ID" ] || SITE_ID=$(create_site "$FALLBACK")
+          fi
+          [ -n "$SITE_ID" ] || { echo "Could not find or create a Netlify site"; exit 1; }
+          echo "Deploying $DIR to Netlify site $SITE_ID"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            netlify deploy --site="$SITE_ID" --dir="$DIR" --alias="pr-${{ github.event.number }}"
+          else
+            netlify deploy --site="$SITE_ID" --dir="$DIR" --prod
+          fi
+
+
+  # ==========================================
+  # VERCEL DEPLOYMENT
+  # ==========================================
+
+  vercel:
+    name: Deploy to Vercel
+    runs-on: ubuntu-latest
+
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel
+
+      - name: Read Git metadata
+        run: |
+          REMOTE_URL="$(git config --get remote.origin.url)"
+          {
+            echo "GIT_COMMIT_SHA=$(git rev-parse HEAD)"
+            echo "GIT_COMMIT_REF=${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
+            echo "GIT_COMMIT_AUTHOR_NAME=$(git log -1 --pretty=format:%an)"
+            echo "GIT_COMMIT_AUTHOR_LOGIN=${GITHUB_ACTOR:-$(git log -1 --pretty=format:%an)}"
+            echo "GIT_COMMIT_MESSAGE=$(git log -1 --pretty=format:%s)"
+            echo "GIT_REPO_OWNER=${GITHUB_REPOSITORY_OWNER:-$(printf '%s' "$REMOTE_URL" | sed -E 's#.*[:/]([^/]+)/[^/]+$#\1#')}"
+            echo "GIT_REPO_NAME=$(basename -s .git "$REMOTE_URL")"
+          } >> "$GITHUB_ENV"
+
+      - name: Deploy preview
+        if: github.event_name == 'pull_request'
+        run: |
+          vercel deploy --yes --token="$VERCEL_TOKEN" \
+            -m githubCommitAuthorLogin="$GIT_COMMIT_AUTHOR_LOGIN" \
+            -m githubCommitAuthorName="$GIT_COMMIT_AUTHOR_NAME" \
+            -m githubCommitMessage="$GIT_COMMIT_MESSAGE" \
+            -m githubCommitOrg="$GIT_REPO_OWNER" \
+            -m githubCommitRef="$GIT_COMMIT_REF" \
+            -m githubCommitRepo="$GIT_REPO_NAME" \
+            -m githubCommitSha="$GIT_COMMIT_SHA" \
+            -m githubDeployment="1" \
+            -m githubOrg="$GIT_REPO_OWNER" \
+            -m githubRepo="$GIT_REPO_NAME"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy production
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          vercel deploy --prod --yes --token="$VERCEL_TOKEN" \
+            -m githubCommitAuthorLogin="$GIT_COMMIT_AUTHOR_LOGIN" \
+            -m githubCommitAuthorName="$GIT_COMMIT_AUTHOR_NAME" \
+            -m githubCommitMessage="$GIT_COMMIT_MESSAGE" \
+            -m githubCommitOrg="$GIT_REPO_OWNER" \
+            -m githubCommitRef="$GIT_COMMIT_REF" \
+            -m githubCommitRepo="$GIT_REPO_NAME" \
+            -m githubCommitSha="$GIT_COMMIT_SHA" \
+            -m githubDeployment="1" \
+            -m githubOrg="$GIT_REPO_OWNER" \
+            -m githubRepo="$GIT_REPO_NAME"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

@@ -1,0 +1,4 @@
+# Netlify only (Vercel reads vercel.json). The single-page fallback: anything
+# that is not a real file gets the app. Real files — /assets/*, /demo/*.json —
+# win over a 200 rule, so this never shadows them.
+/*    /index.html    200
